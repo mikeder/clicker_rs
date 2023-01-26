@@ -1,4 +1,4 @@
 #![warn(clippy::all, rust_2018_idioms)]
 
 mod app;
-pub use app::Clicker;
+pub use app::App;

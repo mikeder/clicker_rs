@@ -1,56 +1,117 @@
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use chrono::Duration;
+
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(default)] // if we add new fields, give them default values when deserializing old state
-pub struct Clicker {
-    // Example stuff:
+pub struct App {
+    // title of the app window
     title: String,
 
-    // this how you opt-out of serialization of a member
-    #[serde(skip)]
-    value: f32,
+    leader_refresh_rate: Duration,
+
+    state: Arc<Mutex<State>>,
 }
 
-impl Default for Clicker {
+struct State {
+    last_updated: chrono::DateTime<chrono::Utc>,
+    learder_board: Vec<Leader>,
+    status_online: bool,
+}
+
+impl Default for State {
     fn default() -> Self {
         Self {
-            // Example stuff:
-            title: "Clicker World!".to_owned(),
-            value: 2.7,
+            last_updated: chrono::Utc::now(),
+            learder_board: vec![],
+            status_online: false,
         }
     }
 }
 
-impl Clicker {
+impl App {
     /// Called once before the first frame.
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // This is also where you can customized the look at feel of egui using
-        // `cc.egui_ctx.set_visuals` and `cc.egui_ctx.set_fonts`.
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let leader_refresh_rate = chrono::Duration::seconds(10);
+        let state = Arc::new(Mutex::new(State::default()));
 
-        // Load previous app state (if any).
-        // Note that you must enable the `persistence` feature for this to work.
-        if let Some(storage) = cc.storage {
-            return eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
+        thread::spawn({
+            let state = state.clone();
+            move || loop {
+                let now = chrono::Utc::now();
+
+                let last_updated = {
+                    let state = state.lock().unwrap();
+                    state.last_updated
+                };
+
+                if now.signed_duration_since(last_updated) > leader_refresh_rate {
+                    let state = state.clone();
+
+                    let req = ehttp::Request {
+                        method: "POST".to_string(),
+                        url: "https://click.sqweeb.net/shitlist.v1.ShitlistService/Leaders"
+                            .to_string(),
+                        body: "{}".as_bytes().to_vec(),
+                        headers: ehttp::headers(&[("Content-Type", "application/json")]),
+                    };
+
+                    ehttp::fetch(req, move |result: ehttp::Result<ehttp::Response>| {
+                        match result {
+                            Err(e) => {
+                                println!("fetch leaders: {}", e);
+                                let mut state = state.lock().unwrap();
+                                state.status_online = false;
+                                state.last_updated = now;
+                                return;
+                            }
+                            Ok(_) => {}
+                        }
+                        let res = result.unwrap();
+                        println!("Status code: {:?}", res.status);
+                        println!("Response: {:?}", std::str::from_utf8(&res.bytes));
+
+                        let res: Result<LeaderResponse, serde_json::Error> =
+                            serde_json::from_slice(&res.bytes);
+                        match res {
+                            Ok(new_leaders) => {
+                                let mut state = state.lock().unwrap();
+                                state.learder_board = new_leaders.top_clickers;
+                                state.last_updated = now;
+                                state.status_online = true;
+                            }
+                            Err(e) => {
+                                let mut state = state.lock().unwrap();
+                                println!("{}", e);
+                                state.last_updated = now;
+                                state.status_online = false;
+                            }
+                        };
+                    });
+                }
+            }
+        });
+
+        Self {
+            title: ("Rusty Clicker").to_string(),
+            leader_refresh_rate: leader_refresh_rate,
+            state: state,
         }
-
-        Default::default()
     }
 }
 
-impl eframe::App for Clicker {
+impl eframe::App for App {
     /// Called by the frame work to save state before shutdown.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, eframe::APP_KEY, self);
+        // eframe::set_value(storage, eframe::APP_KEY, self);
     }
 
-    /// Called each time the UI needs repainting, which may be many times per second.
-    /// Put your widgets into a `SidePanel`, `TopPanel`, `CentralPanel`, `Window` or `Area`.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let Self { title, value } = self;
-
-        // Examples of how to create different panels and windows.
-        // Pick whichever suits you.
-        // Tip: a good default choice is to just keep the `CentralPanel`.
-        // For inspiration and more examples, go to https://emilk.github.io/egui
+        let Self {
+            title,
+            leader_refresh_rate,
+            state,
+        } = self;
 
         #[cfg(not(target_arch = "wasm32"))] // no File->Quit on web pages!
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -67,35 +128,35 @@ impl eframe::App for Clicker {
         egui::SidePanel::left("side_panel").show(ctx, |ui| {
             ui.heading(title);
 
-            ui.add(egui::Slider::new(value, 0.0..=10.0).text("value"));
-            if ui.button("Increment").clicked() {
-                *value += 1.0;
-            }
+            ui.label("Add login here.");
+            ui.label("Add button to click here.");
 
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label("powered by ");
-                    ui.hyperlink_to("egui", "https://github.com/emilk/egui");
-                    ui.label(" and ");
-                    ui.hyperlink_to(
-                        "eframe",
-                        "https://github.com/emilk/egui/tree/master/crates/eframe",
-                    );
-                    ui.label(".");
-                });
-            });
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                let state = state.lock().unwrap();
+                if state.status_online {
+                    ui.label("online");
+                } else {
+                    ui.label("offline");
+                }
+            })
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // The central panel the region left after adding TopPanel's and SidePanel's
+            ui.label("Top Clickers:");
 
-            ui.heading("eframe template");
-            ui.hyperlink("https://github.com/emilk/eframe_template");
-            ui.add(egui::github_link_file!(
-                "https://github.com/emilk/eframe_template/blob/master/",
-                "Source code."
-            ));
+            let state = state.lock().unwrap();
+            egui::Grid::new("top_clickers").show(ui, |ui| {
+                ui.label("User ID");
+                ui.label("Clicks");
+                ui.end_row();
+
+                let leaders = &state.learder_board;
+                for clicker in leaders {
+                    ui.label(&clicker.user_id);
+                    ui.label(&clicker.clicks);
+                    ui.end_row();
+                }
+            });
             egui::warn_if_debug_build(ui);
         });
 
@@ -108,4 +169,18 @@ impl eframe::App for Clicker {
             });
         }
     }
+}
+
+/// a struct into which to decode the thing
+#[derive(serde::Deserialize, serde::Serialize)]
+struct LeaderResponse {
+    #[serde(rename(serialize = "topClickers", deserialize = "topClickers"))]
+    top_clickers: Vec<Leader>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct Leader {
+    #[serde(rename(serialize = "userId", deserialize = "userId"))]
+    user_id: String,
+    clicks: String,
 }
